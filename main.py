@@ -1,62 +1,84 @@
 import asyncio
-import cv2 as cv
-from cv2 import aruco
-from mavsdk import System
+import cv2
+from mavsdk.offboard import VelocityBodyYawspeed
 
-drone = System()
-sysAddr = "udp://:14550"
+import ArucoFinder
+import Drone
 
-async def setup():
-    await drone.connect(system_address=sysAddr)
-
-    print("Waiting for drone to connect...")
-    async for state in drone.core.connection_state():
-        if state.is_connected:
-            print(f"Drone connected at " + sysAddr)
-            break
+SYS_ADDR = "udp://:14445" #"udp://:14550"
+LAND_ALT = 0.8 #Altitude at which auto-land is performed
+MAX_ALT = 10.0 #Maximal altitute at which auto-landing can be performed
+DESC_VELO = 0.2 #Descending velocity [m/s]
+HOR_VELO = 1 #Maximal horizontal velocity [m/s]
+ARUCO_ID = 68 #ID of aruco that should be detecte
+THREASHOLD = 0.5 #Threashold for descending after detection
 
 
 async def main():
-    
-    arucoDict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_100)
+    drone = Drone.Drone()
+    aruco = ArucoFinder.ArucoFinder()
 
+    print("Waiting for drone to connect...")
+    await drone.connect(SYS_ADDR)
+    print(f"Drone connected")
+
+    asyncio.create_task(drone.getAltitude())
+
+    await asyncio.sleep(1) #wait for telemetry
+
+    if drone.altitude > MAX_ALT:
+        print("Current altitude is too high, not landing...")
+        return
+
+    vidCap = cv2.VideoCapture(0)
     if vidCap.isOpened() == False:
         print("Could not open video stream")
+        return
 
-    while vidCap.isOpened():
+    await drone.startOffbaord()
+
+    while True:
         ret, frame = vidCap.read()
 
-        await printPosition()
-
         if ret == True:
-            (markerCorners, markerIds, rejected) = cv.aruco.detectMarkers(frame, arucoDict)#, parameters=arucoParams)
-            if len(markerCorners) > 0:
+            vector = aruco.detect(frame, ARUCO_ID, True)
 
-                cv.aruco.drawDetectedMarkers(frame, markerCorners, markerIds)
-                markerIds = markerIds.flatten()
-                for (markerCorner, markerID) in zip(markerCorners, markerIds):
-                    markerCorners = markerCorner.reshape((4, 2))
-                    print("[INFO] Detected marker: {}".format(markerID))
+            if vector != (-1, -1):
+                forwardVelo = 0.0
+                rightVelo = 0.0
+                downVelo = 0.0
 
-            cv.imshow("Frame", frame)
+                if vector[0]**2 + vector[1]**2 < THREASHOLD**2:
+                    downVelo = DESC_VELO
+                else:
+                    downVelo = 0.0
 
-            key = cv.waitKey(3) & 0xFF
-            if key == ord('q'):
+                forwardVelo = vector[1] * HOR_VELO
+                rightVelo = vector[0] * HOR_VELO
+
+                await drone.setOffboardVelocity(VelocityBodyYawspeed(forwardVelo, rightVelo, downVelo, 0))
+            else:
+                await drone.setOffboardVelocity(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+
+            cv2.imshow("Frame", frame)
+            k = cv2.waitKey(3) & 0xFF
+            if k == 27:
                 break
         else:
             break
 
-async def printPosition(drone=drone):
-    async for position in drone.telemetry.position():
-        print(position)
+        if drone.altitude <= LAND_ALT and drone.altitude >= 0:
+            print("Performing final landig at current position")
+            await drone.touchdown()
+            break
+
+    print("Stopping offboard")
+    await drone.stopOffboard()
+
+    print("Exiting...")
+    vidCap.release()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    vidCap = cv.VideoCapture(0)
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(setup())
-    loop.run_until_complete(main())
-
-    vidCap.release()
-    cv.destroyAllWindows()
+    asyncio.run(main())
