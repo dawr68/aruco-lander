@@ -1,9 +1,21 @@
+#!/usr/bin/env python3.8
+from __future__ import print_function
+
+import roslib
+roslib.load_manifest('aruco')
+import rospy
+import cv2
+from std_msgs.msg import String
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+
 import asyncio
 import cv2
 from mavsdk.offboard import VelocityBodyYawspeed
 
 import ArucoFinder
 import Drone
+import ImageConverter
 
 SYS_ADDR = "udp://:14445" #"udp://:14550"
 LAND_ALT = 0.8 #Altitude at which auto-land is performed
@@ -17,12 +29,12 @@ THREASHOLD = 0.5 #Threashold for descending after detection
 async def main():
     drone = Drone.Drone()
     aruco = ArucoFinder.ArucoFinder()
+    ic = ImageConverter.ImageConverter()
+    rospy.init_node("aruco_lander", anonymous=True)
 
     print("Waiting for drone to connect...")
     await drone.connect(SYS_ADDR)
     print(f"Drone connected")
-
-    asyncio.create_task(drone.getAltitude())
 
     await asyncio.sleep(1) #wait for telemetry
 
@@ -30,41 +42,31 @@ async def main():
         print("Current altitude is too high, not landing...")
         return
 
-    vidCap = cv2.VideoCapture(0)
-    if vidCap.isOpened() == False:
-        print("Could not open video stream")
-        return
-
     await drone.startOffbaord()
 
     while True:
-        ret, frame = vidCap.read()
+        vector = aruco.detect(ic.cv_image, ARUCO_ID, True)
 
-        if ret == True:
-            vector = aruco.detect(frame, ARUCO_ID, True)
+        if vector != (-1, -1):
+            forwardVelo = 0.0
+            rightVelo = 0.0
+            downVelo = 0.0
 
-            if vector != (-1, -1):
-                forwardVelo = 0.0
-                rightVelo = 0.0
+            if vector[0]**2 + vector[1]**2 < THREASHOLD**2:
+                downVelo = DESC_VELO
+            else:
                 downVelo = 0.0
 
-                if vector[0]**2 + vector[1]**2 < THREASHOLD**2:
-                    downVelo = DESC_VELO
-                else:
-                    downVelo = 0.0
+            forwardVelo = vector[1] * HOR_VELO
+            rightVelo = vector[0] * HOR_VELO
 
-                forwardVelo = vector[1] * HOR_VELO
-                rightVelo = vector[0] * HOR_VELO
-
-                await drone.setOffboardVelocity(VelocityBodyYawspeed(forwardVelo, rightVelo, downVelo, 0))
-            else:
-                await drone.setOffboardVelocity(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
-
-            cv2.imshow("Frame", frame)
-            k = cv2.waitKey(3) & 0xFF
-            if k == 27:
-                break
+            await drone.setOffboardVelocity(VelocityBodyYawspeed(forwardVelo, rightVelo, downVelo, 0))
         else:
+            await drone.setOffboardVelocity(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+
+        cv2.imshow("Frame", ic.cv_image)
+        k = cv2.waitKey(3) & 0xFF
+        if k == 27:
             break
 
         if drone.altitude <= LAND_ALT and drone.altitude >= 0:
@@ -76,7 +78,6 @@ async def main():
     await drone.stopOffboard()
 
     print("Exiting...")
-    vidCap.release()
     cv2.destroyAllWindows()
 
 
